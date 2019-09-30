@@ -1,0 +1,109 @@
+pipeline:
+  create_cluster:
+    image: banzaicloud/ci-pipeline-client:0.11
+    action: EnsureCluster
+
+  test:
+    image: python:3.6
+    commands:
+      - pip install --no-cache-dir -r requirements.txt
+      - python manage.py test
+
+  build_image:
+    image: banzaicloud/kaniko-plugin
+    dockerfile: Dockerfile
+    repo: '{{ .CICD_REPO }}'
+    tags: '{{ trunc 7 .CICD_COMMIT_SHA }}'
+    secretFrom:
+      DOCKER_USERNAME:
+        # name:
+        keyRef: username
+      DOCKER_PASSWORD:
+        # name:
+        keyRef: password
+
+  package_application:
+    when:
+      branch:
+        include: [master]
+    image: lachlanevenson/k8s-helm:latest
+    commands:
+      - helm init -c
+      - helm repo add banzaicloud-stable https://kubernetes-charts.banzaicloud.com
+      - helm package ./.banzaicloud/charts/spotguide-flask-postgres-redis
+
+  install_postgresql_user_secret:
+    when:
+      branch:
+        include: [master]
+    image: banzaicloud/ci-pipeline-client:0.11
+    action: InstallSecret
+    clusterSecret:
+      # sourceSecretName:
+      name: '{{ .CICD_REPO_NAME }}-postgresql'
+      namespace: default
+      merge: true
+      spec:
+        - name: postgresql-username
+          source: username
+        - name: postgresql-password
+          source: password
+
+  install_redis_user_secret:
+    when:
+      branch:
+        include: [master]
+    image: banzaicloud/ci-pipeline-client:0.11
+    action: InstallSecret
+    clusterSecret:
+      # sourceSecretName:
+      name: '{{ .CICD_REPO_NAME }}-redis'
+      namespace: default
+      merge: true
+      spec:
+        - name: redis-username
+          source: username
+        - name: redis-password
+          source: password
+
+  deploy_application:
+    when:
+      branch:
+        include: [master]
+    image: banzaicloud/ci-pipeline-client:0.11
+    action: EnsureDeployment
+    deployment:
+      name: './spotguide-flask-postgres-redis-1.0.0.tgz'
+      reuseValues: true
+      releaseName: spotguide-flask-postgres-redis
+      wait: true
+      timeout: 900
+      values:
+        deployment:
+          image:
+            repository: '{{ .CICD_REPO }}'
+            tag: '{{ trunc 7 .CICD_COMMIT_SHA }}'
+            pullPolicy: Always
+        ingress:
+          annotations:
+            kubernetes.io/ingress.class: traefik
+            traefik.ingress.kubernetes.io/redirect-regex: ^http://(.*)
+            traefik.ingress.kubernetes.io/redirect-replacement: https://$1
+            traefik.ingress.kubernetes.io/redirect-permanent: "true"
+          hosts:
+          {{{{- if .platform.AutoDNSEnabled }}}}
+            - '{{ lower (printf "app-%s-%s.%s.%s" .CICD_REPO_NAME (.CLUSTER_NAME | sha1sum | trunc 10) .ORG_NAME .DOMAIN_NAME) }}'
+          {{{{- else }}}}
+            - '/'
+          {{{{- end }}}}
+        postgresql:
+          metrics:
+            enabled: false
+          existingSecret: '{{ .CICD_REPO_NAME }}-postgresql'
+          # postgresqlDatabase:
+        redis:
+          metrics:
+            enabled: false
+          usePassword: true
+          existingSecret: '{{ .CICD_REPO_NAME }}-redis'
+          # redisDatabase:
